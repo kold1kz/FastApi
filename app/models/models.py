@@ -5,8 +5,8 @@ def main(user_id: str):
     return user_id
 
 class User(BaseModel):
-    name: Optional[str] = True
-    age: Optional[int] = True
+    username: Optional[str] = True
+    password: Optional[str] = True
 
 
 class Userresponse(BaseModel):
@@ -28,4 +28,8 @@ class UserCreate(BaseModel):
     age: Union[PositiveInt, None] = None
     is_subscribed: Union[bool, None] = None
 
+
+class Login(BaseModel):
+    username: str
+    password: str
 
