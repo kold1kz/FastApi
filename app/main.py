@@ -1,13 +1,18 @@
 """main file"""
-from datetime import datetime
+from datetime import datetime, timedelta
 import uvicorn
+from typing import Annotated
 from fastapi import FastAPI, Cookie, Response, HTTPException, Depends, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import FileResponse
-from models import models
+from passlib.context import CryptContext
+from models import models, postgres
+from databases import Database
 import hashlib
 import uuid
-from jose import jwt
+import jwt
+
+
 
 
 
@@ -22,10 +27,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-def create_jwt_token(username: str):
-    payload = {"sub": username}
-    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-    return token
+@app.on_event("startup")
+async def startup_database():
+    await postgres.database.connect()
+
+@app.on_event("shutdown")
+async def shutdown_database():
+    await postgres.database.disconnect()
+
+
 
 
 sample_product_1 = {
@@ -123,98 +133,144 @@ async def search(keyword: str, category: str, limit: int):
         result = list(filter(lambda item: item["category"] == category, result))
     return result[:limit]
 
-def get_user(username):
+def get_user1(username):
     """get user"""
     if username in fake_db:
         return fake_db[username]
     return None
 
 
-def verify_session_token(session_token: str = Cookie(None), user=Depends(get_user)):
-    """check verify_ses"""
-    if not session_token or session_token != user["session_token"]:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
+USERS_DATA = {
+    "admin": {"username": "admin", "password": "adminpass", "role": "admin"},
+    "user": {"username": "user", "password": "userpass", "role": "user"},
+    "guest": {"username": "guest", "password": "guestpass", "role": "guest"}
+} 
 
 
-def get_hashed_value(password):
-    """get hashed"""
-    return hashlib.sha256(password.encode()).hexdigest()
 
 
-def check_password(user, password):
-    """check pass"""
-    return user["password"] == get_hashed_value(password)
-
-@app.post("/login2")
-async def login(user: models.Login, response: Response):
-    """login user"""
-    client = get_user(user.username)
-    if not client or not check_password(client, user.password):
-        raise HTTPException(status_code=400, detail="Invalid data")
-
-    session_token = str(uuid.uuid4())
-    fake_db[user.username]["session_token"] = session_token
-
-    response.set_cookie(key="session_token", value=session_token, secure=True)
-
-    return {"message": "Successfully logged"}
-
-@app.post("/register")
-async def register_user(user: models.Login):
-    """reg"""
-    if get_user(user.username):
-        raise HTTPException(status_code=400, detail="Username already exist in database")
-    hashed_password = get_hashed_value(user.password)
-    fake_db[user.username] = {"username": user.username, "password": hashed_password}
-    return "Registration was successful, all 200 :D"
+# Функция для создания JWT токена
+def create_jwt_token(data: dict):
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
 
-@app.get("/user")
-async def get_user_data(user=Depends(verify_session_token)):
-    """get"""
-    return user
 
-@app.get("/headers")
-async def get_headers(request: Request):
-    """headers"""
-    user_agent = request.headers.get("user-agent")
-    accept_language = request.headers.get("accept-language")
-
-    if user_agent is None or accept_language is None:
-        raise HTTPException(status_code=400, detail="Missing required headers")
-
-    response_data = {
-        "User-Agent": user_agent,
-        "Accept-Language": accept_language
-    }
-
-    return response_data
+def get_user_from_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        print("payload 151 = ", payload) # декодируем токен
+        return payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
-USER_DATA = [models.User(**{"username": "user111", "password": "pass1"}), models.User(**{"username": "user2", "password": "pass2"})]
 
-def authenticate_user(form_data: OAuth2PasswordRequestForm=Depends(security)):
-    """auth"""
-    user = get_user_from_db(form_data.username)
-    if user is None or user.password != form_data.password:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-        
-    token = create_jwt_token(user.username)
-    return {"access_token": token, "token_type": "bearer"}
-
-def get_user_from_db(username: str):
-    """get user"""
-    for user in USER_DATA:
-        if user.username == username:
-            return user
+def get_user(username: str):
+    if username in USERS_DATA:
+        user_data = USERS_DATA[username]
+        return models.Login(**user_data)
     return None
 
-@app.get("/login")
-def get_protected_resource(user: models.User = Depends(authenticate_user)):
-    """g"""
-    return {"message": "You got my secret, welcome", "user_info": user}
 
+
+@app.post("/token/")
+def login(user_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user_data_from_db = get_user(user_data.username)
+    if user_data_from_db is None or user_data.password != user_data_from_db.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"access_token": create_jwt_token({"sub": user_data.username})} # тут мы добавляем полезную нагрузку в токен, и говорим, что "sub" содержит значение username
+
+
+# Защищенный роут для админов, когда токен уже получен
+@app.get("/admin/")
+def get_admin_info(current_user: str = Depends(get_user_from_token)):
+    user_data = get_user(current_user)
+    if user_data.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    return {"message": "Welcome Admin!"}
+
+
+# Защищенный роут для обычных пользователей, когда токен уже получен
+@app.get("/user/")
+def get_user_info(current_user: str = Depends(get_user_from_token)):
+    user_data = get_user(current_user)
+    if user_data.role != "user":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    return {"message": "Hello User!"}
+
+@app.get("/guest/")
+def get_user_info(current_user: str = Depends(get_user_from_token)):
+    user_data = get_user(current_user)
+    if user_data.role != "guest":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    return {"message": "Hello User!"}
+
+
+@app.get('/todos/{todo_id}/')
+async def get_todo_id(todo_id: int, db = Depends(postgres.get_db)):
+    """get todo by id"""
+    item = db.query(models.Item).filter(models.Item.id == todo_id).first()
+    
+    if item is None:
+        raise HTTPException(status_code=404, detail="Объект не найден")
+    
+    return item
+
+@app.put("/todos/{todo_id}/", response_model=models.Bd_updated)
+async def update_todo(todo_id: int, new_data:models.Bd_updated, db = Depends(postgres.get_db)):
+    item = db.query(models.Item).filter(models.Item.id == todo_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    for key, value in new_data.dict().items():  # Используйте .dict() для преобразования Pydantic-модели в словарь
+        if key is not None:
+            setattr(item, key, value)
+    db.commit()
+    db.refresh(item) 
+    return item
+
+@app.delete("/todos/{todo_id}/", response_model=str)
+async def delete_todo(todo_id: int,  db = Depends(postgres.get_db)):
+    try:
+        item = db.query(models.Item).filter(models.Item.id == todo_id).first()
+        if item is None:
+            raise HTTPException(status_code=404, detail="Объект не найден")
+        db.delete(item)
+        db.commit()
+        return "Объект удален успешно"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Произошла ошибка при удалении объекта")
+
+
+@app.post("/todos/")
+async def add_todo(user_data: models.Bd_create_todo, db = Depends(postgres.get_db)):
+    try:
+        item=models.Item(title=user_data.title, description=user_data.description, completed=False)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Объект не определен")
+        
+        async with db.begin() as transaction:
+            db.add(item)
+            await transaction.commit()
+            await db.flush()
+
+        return item
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Произошла ошибка при добавлении объекта")
 
 
 
